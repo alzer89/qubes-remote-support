@@ -1,0 +1,281 @@
+#!/bin/bash
+
+set -e
+
+trap sigterm_trap SIGINT SIGTERM
+# List all whonix qubes in dom0, filter all except ones with "whonix" in the name, filter out all other words except qube names, filter all except ones with "dvm" in the name,
+latest_whonix_dispvm=$(qvm-ls | awk '{print $1}' | grep whonix | grep dvm | sort | tail -1)
+
+# Create Whonix DispVM for Provider
+qvm-run --dispvm $latest_whonix_dispvm "sleep infinity" &
+
+purge_dispvm() {
+	qvm-kill $provider_dispvm
+}
+
+trap purge_dispvm EXIT
+
+# Wait a couple of seconds for DispVM to spin up, allowing for slower machines
+sleep 15
+
+# Find out name of Whonix DispVM just spun up, based on start_time
+provider_dispvm=$(qvm-ls --running -O START_TIME,NAME,TEMPLATE,DISPID | grep whonix | grep disp | sort | tail -n 1 | awk '{print $2}')
+
+sigterm_trap() {
+	read -p "Close SSH session and destroy $provider_dispvm? (Y/N): " confirm
+	case $confirm in 
+		y|Y|YES|yes|Yes|yEs|yES|yeS|YEs )
+			read -p "Are you sure? (YES/NO)" really_confirm;
+			sigterm_confirm;;
+		* )
+			echo "invalid response";
+			$output_command "Keeping SSH session open.";;
+	esac
+} 
+
+sigterm_confirm() {
+	case $really_confirm in
+		YES )
+			echo "Destroying $provider_dispvm...";
+			qvm-run $provider_dispvm "sudo pkill -9 sleep";
+			qvm-shutdown $provider_dispvm;
+			echo "$provider_dispvm destroyed.";
+			echo "Hopefully they are thankful for your assistance ;-)";
+			exit 0;;
+		* )
+			echo "Did not confirm properly.  Leaving SSH session open...";;
+	esac
+}
+
+preparation() {
+   if [ ! "$temp_dir" = "" ]; then
+      true "INFO: custom temp_dir"
+      return 0
+   fi
+   temp_dir="$(mktemp --directory)"
+   qvm-run --pass-io $provider_dispvm "mkdir -p $temp_dir/keys"
+}
+
+no_ssh_found() {
+   $output_command "ERROR: ssh client not installed" >&2
+   $output_command ""
+   $output_command "INFO: Installing now..."
+   $output_command ""
+   qvm-run --pass-io $provider_dispvm 'sudo apt-get update && sudo apt-get install --no-install-recommends openssh-client -y'
+}
+
+hostname_malicious() {
+   $output_command "File $temp_dir/qubes-remote-support/keys/hostname in $provider_dispvm might be malicious." >&2
+   $output_command "Do not look at it unless you know what you are doing." >&2
+}
+
+if test -o xtrace ; then
+   output_command=true
+else
+   output_command=echo
+fi
+
+$output_command "INFO: Starting Qubes Remote Support Provider."
+$output_command "INFO: This tool is supposed to be run by those who wish to provide remote support."
+$output_command "INFO: Setting up... This will take a moment..."
+
+if `qvm-run --pass-io $provider_dispvm "test -d ~/.ssh"` ; then
+   $output_command "WARNING: Folder ~/.ssh already exists" >&2
+   $output_command ""
+   $output_command "INFO: It is concerning thst your disposable template contains a  ~/.ssh folder!"
+   $output_command ""
+   $output_command "INFO: You should delete this from your disposable template ASAP!"
+   $output_command ""
+   $output_command "rm -rf ~/.ssh"
+   $output_command ""
+   $output_command "ERROR: Fix this your template and run this script again." >&2
+   sleep 10
+   exit 100
+fi
+
+if `qvm-run --pass-io "test -h /usr/bin/ssh"` ; then
+   ## Whonix
+   if ! `qvm-run --pass-io $provider_dispvm "command -v /usr/bin/ssh.anondist-orig &>/dev/null"` ; then
+      no_ssh_found
+   fi
+else
+   ## Non-Whonix or no uwt installed.
+   if ! `qvm-run --pass-io $provider_dispvm "command -v ssh &>/dev/null"` ; then
+      no_ssh_found
+   fi
+fi
+
+my_vm_name=$(qvm-run --pass-io $provider_dispvm "qubesdb-read /name")
+
+preparation
+qvm-run --pass-io $provider_dispvm "mkdir -p \"$temp_dir/qubes-remote-support\""
+## Test if could create file.
+qvm-run --pass-io $provider_dispvm "touch \"$temp_dir/qubes-remote-support/remote-support-keys.tar.gz\""
+## Test if could delete files.
+qvm-run --pass-io $provider_dispvm "rm \"$temp_dir/qubes-remote-support/remote-support-keys.tar.gz\""
+
+$output_command "INFO: Ask the remote support receiver for the wormhole code phrase and enter it below."
+read -p "Wormhole Code:  " wormhole_code
+## input wormhole code and press enter
+## to confirm, press y and press enter
+$output_command "Attempting to recover file..."
+qvm-run --pass-io $provider_dispvm "wormhole receive $wormhole_code --accept-file -o $temp_dir/qubes-remote-support/remote-support-keys.tar.gz"
+## Example output including user interaction:
+# Enter receive wormhole code: 8-reproduce-virus
+#  (note: you can use <Tab> to complete words)
+# Waiting for sender...
+# Receiving file (817 Bytes) into: remote-support-keys.tar.gz
+# ok? (y/N): y
+# Receiving (->relay:tcp:magic-wormhole-transit.debian.net:4001)..
+# 100%|| 817/817 [00:00<00:00, 2.49MB/s]
+# Received file written to remote-support-keys.tar.gz
+
+## As seen in output above, wormhole points out the file size beforehand.
+
+if ! `qvm-run $provider_dispvm "test -f $temp_dir/qubes-remote-support/remote-support-keys.tar.gz"` ; then
+   $output_command "ERROR: error receiving file!"
+   $output_command "ERROR: file $temp_dir/qubes-remote-support/remote-support-keys.tar.gz does not exist!"
+   exit 102
+fi
+
+$output_command "INFO: Success, received remote support archive file '$temp_dir/qubes-remote-support/remote-support-keys.tar.gz'."
+$output_command "INFO: (That file allows a Qubes Remote Support Provider to connect to this machine.)"
+$output_command "INFO: (No need to do anything with that file.)"
+$output_command "INFO: Setting up... This will take a moment..."
+
+## Debugging.
+if test -o xtrace ; then
+   qvm-run --pass-io $provider_dispvm "ls -la $temp_dir/qubes-remote-support/remote-support-keys.tar.gz"
+fi
+
+file_size=$(qvm-run --pass-io $provider_dispvm "stat --printf="%s" $temp_dir/qubes-remote-support/remote-support-keys.tar.gz")
+## example output:
+## 818
+
+if [ "$file_size" -ge 1000 ]; then
+   $output_command "ERROR: file_size of $temp_dir/qubes-remote-support/remote-support-keys.tar.gz larger than 1000. file_size: $file_size"
+   exit 102
+fi
+
+if test -o xtrace ; then
+   qvm-run --pass-io $provider_dispvm "tar --warning=no-timestamp -xvf $temp_dir/qubes-remote-support/remote-support-keys.tar.gz -C $temp_dir/qubes-remote-support"
+else
+   qvm-run --pass-io $provider_dispvm "tar --warning=no-timestamp -xvf $temp_dir/qubes-remote-support/remote-support-keys.tar.gz -C $temp_dir/qubes-remote-support" >/dev/null
+fi
+
+## Debugging.
+if test -o xtrace ; then
+   qvm-run --pass-io $provider_dispvm "ls -la $temp_dir/qubes-remote-support/keys"
+fi
+
+hostname=$(qvm-run --pass-io $provider_dispvm "cat $temp_dir/qubes-remote-support/keys/hostname")
+## Example hostname:
+## pp3nxkdbekhaac6r57blbrgniramltvriuukw6g6vqpbudymk33mpnyd.onion
+
+string_length_ofhostname="${#hostname}"
+if [ ! "$string_length_ofhostname" = "62" ]; then
+   $output_command "ERROR: hostname string string is not 62. it is: $string_length_ofhostname" >&2
+   hostname_malicious
+   exit 200
+fi
+if ! [[ "$hostname" =~ ^[.0-9a-zA-Z_-]+$ ]]; then
+   $output_command "ERROR: hostname contains invalid character!" >&2
+   hostname_malicious
+   exit 201
+fi
+if ! [[ "$hostname" == *.onion ]]; then
+   $output_command "ERROR: hostname does not end with '.onion'!" >&2
+   hostname_malicious
+   exit 202
+fi
+
+## Rely on ssh for sanitation.
+ssh_algorithm=`qvm-run --pass-io $provider_dispvm "cat $temp_dir/qubes-remote-support/keys/ssh_algorithm"`
+## Example ssh_algorithm:
+## ssh-ed25519
+
+## Rely on ssh for sanitation.
+ssh_fingerprint=`qvm-run --pass-io $provider_dispvm "cat $temp_dir/qubes-remote-support/keys/ssh_fingerprint"`
+## Example ssh_fingerprint:
+## AAAAC3NzaC1lZDI1NTE5AAAAICF7BLyxUHVzpwD9DVcG5+H+1TydgvcQlTQdKrXqNgFF
+
+ssh_known_keys_line="$hostname $ssh_algorithm $ssh_fingerprint"
+
+qvm-run --pass-io $provider_dispvm "mkdir -p ~/.ssh"
+## Rely on ssh for sanitation of id_ed25519.pub.
+qvm-run --pass-io $provider_dispvm "cp $temp_dir/qubes-remote-support/keys/id_ed25519.pub ~/.ssh/"
+## Rely on ssh for sanitation of id_ed25519.
+qvm-run --pass-io $provider_dispvm "cp $temp_dir/qubes-remote-support/keys/id_ed25519 ~/.ssh/"
+qvm-run --pass-io $provider_dispvm "echo $ssh_known_keys_line > ~/.ssh/known_hosts"
+qvm-run --pass-io $provider_dispvm "chmod 700 ~/.ssh"
+qvm-run --pass-io $provider_dispvm "chmod 600 ~/.ssh/*"
+
+## example id_ed25519:
+## -----BEGIN OPENSSH PRIVATE KEY-----
+## b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+## QyNTUxOQAAACAEJ82o4Knq4gSJAr0Mke+5y2fdl6vo8v+dBlz5bKfSyQAAALDJ/1Ulyf9V
+## JQAAAAtzc2gtZWQyNTUxOQAAACAEJ82o4Knq4gSJAr0Mke+5y2fdl6vo8v+dBlz5bKfSyQ
+## AAAEBFm5blNb/E4K9WL6NhqyffoPrbuwtiGkCs0hOyHsb4cAQnzajgqeriBIkCvQyR77nL
+## Z92Xq+jy/50GXPlsp9LJAAAALHF1YmVzLXJlbW90ZS1zdXBwb3J0LXJlY2VpdmVyLWF1dG
+## 8tZ2VuZXJhdGVkAQ==
+## -----END OPENSSH PRIVATE KEY-----
+
+## example id_ed25519.pub:
+#ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAQnzajgqeriBIkCvQyR77nLZ92Xq+jy/50GXPlsp9LJ qubes-remote-support-receiver-auto-generated
+
+$output_command ""
+$output_command "Success. Setting everything up..."
+$output_command ""
+
+## Example 1.auth_private contents:
+## pp3nxkdbekhaac6r57blbrgniramltvriuukw6g6vqpbudymk33mpnyd:descriptor:x25519:CC2Z373LXU36QEKG5JIFCFMUDOYB73U26MZ6FAQDGLOWYQAGWBBA
+
+## TODO: qvm-copy and a dom0 prompt is not very convenient.
+##       Is there any elegant way to automate that?
+##
+## Rely on Tor for sanitation of 1.auth_private.
+qvm-run --pass-io  "cat $temp_dir/qubes-remote-support/keys/1.auth_private" > /tmp/1.auth_private
+$output_command "INFO: Private key copied from $provider_dispvm to dom0..."
+qvm-run sys-whonix "sudo rm ~/QubesIncoming/dom0/1.auth_private"
+qvm-copy-to-vm sys-whonix /tmp/1.auth_private
+$output_command "INFO: Private key removed from dom0 to sys-whonix..."
+rm /tmp/1.auth_private
+$output_command "INFO: Private key removed from dom0..."
+
+$output_command "INFO: Install authenticated Tor onion v3 service private key by running the following command in sys-whonix:"
+$output_command ""
+qvm-run --pass-io sys-whonix "sudo sourcefile=~/QubesIncoming/dom0/1.auth_private anon-server-to-client-install"
+$output_command ""
+qvm-copy-to-vm $provider_dispvm /tmp/ssh-into-remote-machine.sh
+qvm-run $provider_dispvm "sudo cp ~/QubesIncoming/dom0/ssh-into-remote-machine.sh /usr/local/bin"
+qvm-run $provider_dispvm "sudo chmod +x /usr/local/bin/ssh-into-remote-machine.sh"
+$output_command "INFO: Do you want to SSH into '$hostname'?"
+$output_command "INFO: Press enter to continue."
+read press_enter_to_continue
+$output_command ""
+$output_command "Please Enter the dom0 user name of the target machine."
+read -p "Target Machine dom0 Username:  " dom0_username
+$output_command "INFO: Trying SSH..."
+$output_command "INFO: Will keep trying to run the following command..."
+$output_command "INFO: This can take up to 10 minutes."
+$output_command ""
+$output_command ""
+$output_command "INFO: Opening xfce4-terminal in $provider_dispvm"
+$output_command "INFO: "
+qvm-run $provider_dispvm "echo $dom0_username > /tmp/dom0_username"
+qvm-run $provider_dispvm "echo $hostname > /tmp/remote_hostname"
+qvm-run $provider_dispvm "xfce4-terminal --execute ssh-into-remote-machine.sh --hold"
+## Required 13 retries during testing until onion v3 service was ready.
+## Took 3:30 minutes.
+## Another attempt:
+## Required 33 retries during testing until onion v3 service was ready.
+## Took 5:30 minutes.
+$output_command ""
+$output_command ""
+$output_command ""
+$output_command ""
+$output_command ""
+$output_command ""
+$output_command "INFO: When you would like to close the SSH session, or press Ctrl+C to destroy $provider_dispvm"
+
+exit 0;
